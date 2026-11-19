@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+# local config/state never belongs in the repo
+config.json
+overrides.json
+state.json
