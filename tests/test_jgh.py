@@ -18,8 +18,14 @@ def pr(state, base="main", default="main", number=1):
             "base": base, "default_branch": default, "draft": False}
 
 
-def issue(status, no_code=False):
-    return {"key": "PROJ-1", "status": status, "no_code": no_code}
+def issue(status, no_code=False, type="Bug", target=None):
+    i = {"key": "PROJ-1", "status": status, "no_code": no_code, "type": type}
+    if target:
+        i["target"] = target
+    return i
+
+
+STORY_DONE = dict(CFG, target_status_by_type={"Story": "Done"})
 
 
 class ExtractKey(unittest.TestCase):
@@ -67,15 +73,43 @@ class Classify(unittest.TestCase):
         self.assertEqual(jgh.classify(issue("In Progress", no_code=True), [pr("MERGED")], CFG), "move")
 
 
+class Targets(unittest.TestCase):
+    def test_target_resolution(self):
+        self.assertEqual(jgh.target_of(issue("To Do"), STORY_DONE), "Testing")
+        self.assertEqual(jgh.target_of(issue("To Do", type="Story"), STORY_DONE), "Done")
+        self.assertEqual(jgh.target_of(issue("To Do", target="Done"), CFG), "Done")
+
+    def test_story_in_testing_is_still_owned(self):
+        story = issue("Testing", type="Story")
+        self.assertEqual(jgh.classify(story, [pr("MERGED")], STORY_DONE), "move")
+        self.assertEqual(jgh.classify(story, [pr("OPEN")], STORY_DONE), "wip")
+        self.assertEqual(jgh.classify(issue("Done", type="Story"), [pr("MERGED")], STORY_DONE), "ok")
+        self.assertEqual(jgh.classify(issue("Done", type="Story"), [], STORY_DONE), "ok")
+
+    def test_bug_unchanged(self):
+        self.assertEqual(jgh.classify(issue("Testing"), [pr("MERGED")], STORY_DONE), "ok")
+        self.assertEqual(jgh.classify(issue("Testing"), [], STORY_DONE), "warn_noprs")
+
+    def test_no_code_story(self):
+        story = issue("Testing", type="Story", no_code=True)
+        self.assertEqual(jgh.classify(story, [], STORY_DONE), "nocode")
+
+    def test_jql_includes_extra_statuses_per_type(self):
+        jql = jgh.my_issues_jql(STORY_DONE)
+        self.assertIn('(issuetype in ("Story") AND status in ("Testing"))', jql)
+
+
 class Workflow(unittest.TestCase):
     def test_plan_hops(self):
         self.assertEqual(jgh.plan_hops("In Progress", CFG), ["In Review", "Testing"])
         self.assertEqual(jgh.plan_hops("Blocked", CFG), ["Testing"])
+        self.assertEqual(jgh.plan_hops("In Progress", CFG, "Done"), ["In Review", "Testing", "Done"])
 
     def test_jql(self):
         jql = jgh.my_issues_jql(CFG)
         self.assertIn('project in ("PROJ")', jql)
         self.assertIn('status in ("To Do", "In Progress", "In Review")', jql)
+        self.assertNotIn("issuetype", jql)
         self.assertNotIn("project in", jgh.my_issues_jql(jgh.DEFAULT_CONFIG))
 
 

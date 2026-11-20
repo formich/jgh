@@ -76,6 +76,7 @@ jgh link   PROJ-123 my-org/my-repo#42   # attach a PR manually (a PR URL works t
 jgh unlink PROJ-123 my-org/my-repo#42   # detach a PR the branch name matched
 jgh ignore PROJ-123 | my-org/my-repo#42 [--undo]   # hide an issue or a PR
 jgh nocode PROJ-123 [--undo]            # issue needs no code (see below)
+jgh target PROJ-123 Done | --undo       # different target status for one issue
 ```
 
 ## How it works
@@ -105,13 +106,24 @@ jgh nocode PROJ-123 [--undo]            # issue needs no code (see below)
 
 ### Transitions
 
-`jgh sync` moves an issue along `workflow_path` until it reaches `target_status`. For example,
+`jgh sync` moves an issue along `workflow_path` until it reaches its target status. For example,
 from `In Progress` it goes to `In Review` and then to `Testing`. At each step it uses the
 transitions Jira actually offers, so no transition IDs are hard-coded. If a step is not allowed,
 the issue stays where it is and `jgh` says so.
 
 The tool never transitions anything without confirmation, unless you pass `--yes`. When stdin
 is not a terminal, `sync` behaves as a dry run.
+
+### Issue types that skip QA
+
+Not every issue goes through QA. Stories, for example, may be considered finished when they
+reach `Done`, not `Testing`. You can give them a different target:
+
+- per issue type, in the config: `"target_status_by_type": {"Story": "Done"}`, or
+- per issue: `jgh target PROJ-123 Done` (undo with `jgh target PROJ-123 --undo`).
+
+The target must be listed in `workflow_path`. Every status before it counts as the
+developer's, so a Story sitting in `Testing` with all PRs merged is proposed for `Done`.
 
 ### Issues that need no code
 
@@ -138,8 +150,9 @@ it gets a PR after all, the normal rules apply again.
 | `github_owners` | `[]` | Orgs/users to search PRs in; empty means all PRs you authored |
 | `pr_lookback_days` | `90` | How far back to look for merged PRs |
 | `dev_statuses` | `To Do`, `In Progress`, `In Review` | Statuses still owned by the developer |
-| `workflow_path` | `To Do` → `In Progress` → `In Review` → `Testing` | Path walked by `sync` |
+| `workflow_path` | `To Do` → `In Progress` → `In Review` → `Testing` → `Done` | Path walked by `sync` |
 | `target_status` | `Testing` | Hand-over status |
+| `target_status_by_type` | `{}` | Target per issue type, e.g. `{"Story": "Done"}` |
 | `handed_over_statuses` | `Testing`, `Done` | Statuses at or past the hand-over |
 | `terminal_statuses` | `Done` | Statuses that are safe to cache |
 | `issue_cache_hours` | `72` | Cache lifetime for terminal issues |
@@ -153,7 +166,7 @@ Environment variables: `JIRA_API_TOKEN` (required), `JIRA_EMAIL`, `JIRA_BASE_URL
 
 Other files in the same directory:
 
-- `overrides.json` holds your manual `link`, `unlink`, `ignore` and `nocode` entries.
+- `overrides.json` holds your manual `link`, `unlink`, `ignore`, `nocode` and `target` entries.
 - `state.json` holds the last mapping snapshot and the issue status cache.
 
 Tokens are only read from the environment and are never written to disk.

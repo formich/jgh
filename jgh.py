@@ -58,10 +58,13 @@ DEFAULT_CONFIG = {
     "issue_cache_hours": 72,
     # Statuses where the issue is still the developer's responsibility.
     "dev_statuses": ["To Do", "In Progress", "In Review"],
-    # Ordered path the tool walks to reach the target status.
-    "workflow_path": ["To Do", "In Progress", "In Review", "Testing"],
+    # Ordered path the tool walks to reach the target status. Statuses before an
+    # issue's target count as the developer's too.
+    "workflow_path": ["To Do", "In Progress", "In Review", "Testing", "Done"],
     # Hand-over status: where an issue goes once all its PRs are merged.
     "target_status": "Testing",
+    # Per issue type target, e.g. {"Story": "Done"} for types that skip QA.
+    "target_status_by_type": {},
     # Statuses at or past the hand-over.
     "handed_over_statuses": ["Testing", "Done"],
     # Branch keys that are placeholders, not real issues (PROJ-0, PROJ-000, ...).
@@ -77,6 +80,8 @@ DEFAULT_OVERRIDES = {
     "ignore": [],
     # issue keys that need no code: no "missing PR" warning, moved on demand
     "no_code": [],
+    # "PROJ-123": "Done"  -> per-issue target status
+    "targets": {},
 }
 
 
@@ -425,23 +430,43 @@ def pr_is_done(pr: dict) -> bool:
     return pr["state"] == "MERGED" and pr["base"] == pr["default_branch"]
 
 
+def target_of(issue: dict, cfg: dict) -> str:
+    """Target status of an issue: per-issue override, then per type, then default."""
+    return (
+        issue.get("target")
+        or (cfg.get("target_status_by_type") or {}).get(issue.get("type", ""))
+        or cfg["target_status"]
+    )
+
+
+def owned_statuses(target: str, cfg: dict) -> List[str]:
+    """Statuses in which an issue with this target is still the developer's."""
+    owned = list(cfg["dev_statuses"])
+    path = cfg["workflow_path"]
+    if target in path:
+        owned += [s for s in path[: path.index(target)] if s not in owned]
+    return owned
+
+
 def classify(issue: dict, prs: List[dict], cfg: dict) -> str:
     """Return one of: move, nocode, wip, warn_open, warn_noprs, ok, other, ignore."""
     live = [p for p in prs if p["state"] != "CLOSED"]  # closed-unmerged PRs don't count
     status = issue["status"]
+    target = target_of(issue, cfg)
+    owned = owned_statuses(target, cfg)
     if issue.get("no_code") and not live:
         # No PR to watch: the developer decides when it's done (`jgh sync KEY`).
-        if status in cfg["dev_statuses"]:
+        if status in owned:
             return "nocode"
-        return "ok" if status in cfg["handed_over_statuses"] else "ignore"
-    if status in cfg["dev_statuses"]:
+        return "ok" if status in cfg["handed_over_statuses"] or status == target else "ignore"
+    if status in owned:
         if live and all(pr_is_done(p) for p in live):
             return "move"
         return "wip"
-    if status in cfg["handed_over_statuses"]:
+    if status in cfg["handed_over_statuses"] or status == target:
         if any(p["state"] == "OPEN" for p in live):
             return "warn_open"
-        if status == cfg["target_status"] and not live:
+        if status == target and not live and target not in cfg.get("terminal_statuses", []):
             return "warn_noprs"
         return "ok"
     if any(p["state"] == "OPEN" or pr_is_done(p) for p in live):
@@ -458,10 +483,18 @@ def my_issues_jql(cfg: dict) -> str:
     clauses = ["assignee = currentUser()"]
     if cfg["project_keys"]:
         clauses.append(f"project in ({_jql_list(cfg['project_keys'])})")
-    clauses.append(
-        f"(status in ({_jql_list(cfg['dev_statuses'])}) OR "
-        f"(status = {json.dumps(target)} AND status CHANGED TO {json.dumps(target)} AFTER -{days}d))"
-    )
+    owned = owned_statuses(target, cfg)
+    parts = [f"status in ({_jql_list(owned)})"]
+    # Issue types with a later target are still owned in some extra statuses.
+    by_target: Dict[str, List[str]] = {}
+    for itype, t in sorted((cfg.get("target_status_by_type") or {}).items()):
+        by_target.setdefault(t, []).append(itype)
+    for t, types in sorted(by_target.items()):
+        extra = [s for s in owned_statuses(t, cfg) if s not in owned]
+        if extra:
+            parts.append(f"(issuetype in ({_jql_list(types)}) AND status in ({_jql_list(extra)}))")
+    parts.append(f"(status = {json.dumps(target)} AND status CHANGED TO {json.dumps(target)} AFTER -{days}d)")
+    clauses.append("(" + " OR ".join(parts) + ")")
     return " AND ".join(clauses)
 
 
@@ -471,6 +504,15 @@ def _load_issue_cache() -> dict:
             return json.load(f).get("issue_cache", {})
     except (FileNotFoundError, ValueError):
         return {}
+
+
+def annotate(issue: dict, cfg: dict, ov: dict) -> None:
+    """Add the local flags: no_code (override or label) and target status."""
+    key = issue["key"]
+    labels = set(cfg.get("no_code_labels") or [])
+    issue["no_code"] = key in ov.get("no_code", []) or bool(labels & set(issue.get("labels", [])))
+    issue.pop("target", None)
+    issue["target"] = (ov.get("targets") or {}).get(key) or target_of(issue, cfg)
 
 
 def build_mapping(cfg: dict, jira: "Jira", ov: dict, refresh: bool = False) -> dict:
@@ -513,12 +555,13 @@ def build_mapping(cfg: dict, jira: "Jira", ov: dict, refresh: bool = False) -> d
     ttl = dt.timedelta(hours=cfg.get("issue_cache_hours", 72))
     terminal = set(cfg.get("terminal_statuses", []))
     missing = []
-    for k in by_key:
+    targets = ov.get("targets") or {}
+    for k in sorted(set(by_key) | set(targets)):
         if k in issues:
             continue
         hit = cache.get(k)
         fresh = hit and now - dt.datetime.fromisoformat(hit["fetched_at"]) < ttl
-        no_open = all(p["state"] != "OPEN" for p in by_key[k])
+        no_open = all(p["state"] != "OPEN" for p in by_key.get(k, []))
         if fresh and hit["issue"]["status"] in terminal and no_open:
             issues[k] = dict(hit["issue"], cached=True)
         else:
@@ -531,13 +574,11 @@ def build_mapping(cfg: dict, jira: "Jira", ov: dict, refresh: bool = False) -> d
         for k, i in issues.items()
     }
 
-    no_code = set(ov.get("no_code", []))
-    no_code_labels = set(cfg.get("no_code_labels") or [])
     rows = []
     for key, issue in issues.items():
         if key in ignore:
             continue
-        issue["no_code"] = key in no_code or bool(no_code_labels & set(issue["labels"]))
+        annotate(issue, cfg, ov)
         linked = sorted(by_key.get(key, []), key=lambda p: (p["repo"], p["number"]))
         rows.append({"issue": issue, "prs": linked, "verdict": classify(issue, linked, cfg)})
     unknown = sorted(k for k in by_key if k not in issues)
@@ -574,10 +615,12 @@ def save_state(mapping: dict) -> None:
 # ---------------------------------------------------------------------- display
 
 
-def sections(cfg: dict) -> List[tuple]:
+def sections(cfg: dict, move_targets: Optional[set] = None) -> List[tuple]:
     t = cfg["target_status"]
+    targets = move_targets or {t}
+    ready = f"Ready for {next(iter(targets))}" if len(targets) == 1 else "Ready to move"
     return [
-        ("move", f"Ready for {t} (all PRs merged)", "33;1"),
+        ("move", f"{ready} (all PRs merged)", "33;1"),
         ("warn_open", f"Already in {t} or later, but PRs still open", "31;1"),
         ("warn_noprs", f"In {t} with no PR found", "35;1"),
         ("other", "Not in a dev status, but code attached", "36;1"),
@@ -604,7 +647,9 @@ def trunc(s: str, n: int) -> str:
 
 def print_report(mapping: dict, cfg: dict, show_all: bool, plain_urls: bool = False) -> None:
     rows = mapping["rows"]
-    for verdict, title, color in sections(cfg):
+    default = cfg["target_status"]
+    move_targets = {target_of(r["issue"], cfg) for r in rows if r["verdict"] == "move"}
+    for verdict, title, color in sections(cfg, move_targets):
         group = [r for r in rows if r["verdict"] == verdict]
         if not group or (verdict == "ok" and not show_all):
             continue
@@ -613,6 +658,9 @@ def print_report(mapping: dict, cfg: dict, show_all: bool, plain_urls: bool = Fa
             i = r["issue"]
             empty = "no code needed" if i.get("no_code") else "no PR"
             prs = ", ".join(fmt_pr(p) for p in r["prs"]) or c(empty, "90")
+            target = target_of(i, cfg)
+            if target != default and verdict in ("move", "nocode", "wip"):
+                prs += c(f"  → {target}", "36")
             key = link(i["key"], i["url"]) + " " * max(1, 11 - len(i["key"]))
             print(f"  {key}{c(i['status'].ljust(16), '1')} {trunc(i['summary'], 60)}")
             print(f"  {'':11}{'':16} └ {prs}")
@@ -627,23 +675,32 @@ def print_report(mapping: dict, cfg: dict, show_all: bool, plain_urls: bool = Fa
     ok = sum(1 for r in rows if r["verdict"] == "ok")
     if ok and not show_all:
         print(c(f"\n{ok} issues in sync hidden (use --all to show them).", "90"))
-    moves = sum(1 for r in rows if r["verdict"] == "move")
+    moves: Dict[str, int] = {}
+    for r in rows:
+        if r["verdict"] == "move":
+            t = target_of(r["issue"], cfg)
+            moves[t] = moves.get(t, 0) + 1
     if moves:
-        print(c(f"\n→ run `jgh sync` to move {moves} issue(s) to {cfg['target_status']} (asks first).", "33"))
+        if len(moves) == 1:
+            where = f"{sum(moves.values())} issue(s) to {next(iter(moves))}"
+        else:
+            where = ", ".join(f"{n} to {t}" for t, n in sorted(moves.items()))
+        print(c(f"\n→ run `jgh sync` to move {where} (asks first).", "33"))
 
 
 # ------------------------------------------------------------------- transition
 
 
-def plan_hops(current: str, cfg: dict) -> List[str]:
-    path, target = cfg["workflow_path"], cfg["target_status"]
+def plan_hops(current: str, cfg: dict, target: Optional[str] = None) -> List[str]:
+    path, target = cfg["workflow_path"], target or cfg["target_status"]
     if current in path and target in path:
         return path[path.index(current) + 1 : path.index(target) + 1]
     return [target]
 
 
-def move_to_target(jira: "Jira", key: str, cfg: dict, dry_run: bool, current: str) -> bool:
-    target = cfg["target_status"]
+def move_to_target(jira: "Jira", key: str, cfg: dict, dry_run: bool, current: str,
+                   target: Optional[str] = None) -> bool:
+    target = target or cfg["target_status"]
     for _ in range(len(cfg["workflow_path"]) + 1):
         if current == target:
             return True
@@ -651,7 +708,7 @@ def move_to_target(jira: "Jira", key: str, cfg: dict, dry_run: bool, current: st
         if target in available:
             step = available[target]
         else:
-            step = next((available[s] for s in plan_hops(current, cfg) if s in available), None)
+            step = next((available[s] for s in plan_hops(current, cfg, target) if s in available), None)
         if step is None:
             print(c(f"    no transition from '{current}' towards '{target}' "
                     f"(available: {', '.join(available) or '-'}); issue left in '{current}'", "31"))
@@ -660,7 +717,7 @@ def move_to_target(jira: "Jira", key: str, cfg: dict, dry_run: bool, current: st
             # Only the first hop can be checked against Jira; later hops are the planned path.
             hops = [step["to"]["name"]]
             if hops[0] != target:
-                hops += plan_hops(hops[0], cfg)
+                hops += plan_hops(hops[0], cfg, target)
             print(f"    {' → '.join([current] + hops)}" + c("  (dry-run)", "90"))
             return True
         print(f"    {current} → {step['to']['name']}")
@@ -698,7 +755,6 @@ def cmd_status(args, cfg, ov):
 
 def cmd_sync(args, cfg, ov):
     jira = Jira(cfg)
-    target = cfg["target_status"]
     mapping = build_mapping(cfg, jira, ov, args.refresh)
     save_state(mapping)
     movable = ("move", "nocode") if args.keys else ("move",)
@@ -711,7 +767,7 @@ def cmd_sync(args, cfg, ov):
             why = f"status '{row['issue']['status']}', verdict '{row['verdict']}'" if row else "not tracked"
             print(c(f"{k}: cannot be moved ({why}).", "33"))
     if not todo:
-        print(c(f"Nothing to move to {target}.", "32"))
+        print(c("Nothing to move.", "32"))
         return
     if not args.dry_run and not args.yes and not sys.stdin.isatty():
         print(c("stdin is not interactive: no transition performed (use --yes to force).", "33"))
@@ -720,6 +776,7 @@ def cmd_sync(args, cfg, ov):
     moved = 0
     for r in todo:
         i = r["issue"]
+        target = target_of(i, cfg)
         print(f"\n{c(i['key'], '1')} [{i['status']}] {trunc(i['summary'], 70)}")
         print("    PRs: " + (", ".join(fmt_pr(p) for p in r["prs"]) or c("no code needed", "90")))
         if not (all_yes or args.dry_run):
@@ -732,7 +789,7 @@ def cmd_sync(args, cfg, ov):
                 print(c("    skipped", "90"))
                 continue
         try:
-            if move_to_target(jira, i["key"], cfg, args.dry_run, i["status"]):
+            if move_to_target(jira, i["key"], cfg, args.dry_run, i["status"], target):
                 moved += 0 if args.dry_run else 1
                 if not args.dry_run:
                     print(c(f"    ✓ now in {target}", "32"))
@@ -752,10 +809,11 @@ def cmd_show(args, cfg, ov):
         if not raw:
             die(f"{key} not found in Jira.")
         issue = simplify_issue(raw[0], jira.base)
+        annotate(issue, cfg, ov)
         prs = mapping["prs_by_key"].get(key, [])
         row = {"issue": issue, "prs": prs, "verdict": classify(issue, prs, cfg)}
     i = row["issue"]
-    print(f"{c(i['key'], '1')}  {i['type']}  [{i['status']}]  → {row['verdict']}")
+    print(f"{c(i['key'], '1')}  {i['type']}  [{i['status']}]  target: {target_of(i, cfg)}  → {row['verdict']}")
     print(f"  {i['summary']}\n  {i['url']}")
     for p in row["prs"]:
         merged = f" merged {p['merged_at'][:10]}" if p["merged_at"] else ""
@@ -804,6 +862,20 @@ def cmd_nocode(args, cfg, ov):
         if key not in ov["no_code"]:
             ov["no_code"].append(key)
         print(f"{key}: marked as no code needed")
+    _save_json(OVERRIDES_FILE, ov)
+
+
+def cmd_target(args, cfg, ov):
+    key = args.key.upper()
+    ov.setdefault("targets", {})
+    if args.undo or not args.status:
+        if not args.undo:
+            die("give a status, e.g. `jgh target PROJ-123 Done`, or --undo")
+        ov["targets"].pop(key, None)
+        print(f"{key}: back to the default target")
+    else:
+        ov["targets"][key] = args.status
+        print(f"{key}: target status is now '{args.status}'")
     _save_json(OVERRIDES_FILE, ov)
 
 
@@ -857,7 +929,7 @@ def main(argv=None):
     s.add_argument("--urls", action="store_true", help="also print Jira URLs in plain text")
     s.add_argument("--refresh", action="store_true", help="bypass the Jira status cache")
 
-    s = sub.add_parser("sync", help="move issues whose PRs are all merged to the target status")
+    s = sub.add_parser("sync", help="move issues whose PRs are all merged to their target status")
     s.add_argument("keys", nargs="*", help="only these issue keys")
     s.add_argument("--dry-run", "-n", action="store_true", help="show transitions without running them")
     s.add_argument("--yes", "-y", action="store_true", help="don't ask for confirmation")
@@ -882,6 +954,11 @@ def main(argv=None):
     s.add_argument("key")
     s.add_argument("--undo", action="store_true")
 
+    s = sub.add_parser("target", help="set the target status of one issue (e.g. Done)")
+    s.add_argument("key")
+    s.add_argument("status", nargs="?", help="target status name, as in Jira")
+    s.add_argument("--undo", action="store_true", help="back to the default target")
+
     sub.add_parser("doctor", help="check configuration and authentication")
 
     s = sub.add_parser("init", help="create the configuration file")
@@ -898,7 +975,7 @@ def main(argv=None):
     handlers = {
         "status": cmd_status, "sync": cmd_sync, "show": cmd_show,
         "link": cmd_link, "unlink": cmd_unlink, "ignore": cmd_ignore,
-        "nocode": cmd_nocode, "doctor": cmd_doctor, "init": cmd_init,
+        "nocode": cmd_nocode, "target": cmd_target, "doctor": cmd_doctor, "init": cmd_init,
     }
     try:
         handlers[args.cmd](args, cfg, ov)
